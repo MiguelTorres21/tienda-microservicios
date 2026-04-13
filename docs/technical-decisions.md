@@ -1,395 +1,145 @@
-# Tienda Microservicios
+# Decisiones Técnicas
 
-Aplicación full stack basada en microservicios para administración de productos y compras con inventario.
+## Base de datos: una por microservicio
 
-El proyecto está compuesto por:
+Cada servicio tiene su propia instancia de PostgreSQL (`products-db` en `:5432`,
+`inventory-db` en `:5433`). No hay acceso cruzado a tablas entre servicios.
 
-- `products-service`: CRUD de productos, autenticación JWT y endpoint interno protegido con API Key.
-- `inventory-service`: consulta de inventario, compras con idempotencia, manejo de concurrencia y resiliencia frente a
-  fallos de `products-service`.
-- `frontend`: SPA en Vue 3 para login, listado, detalle de producto y flujo de compra.
-- `infra`: orquestación de bases de datos y servicios backend con Docker Compose.
+**Por qué:** aislamiento de dominio — `inventory-service` no puede leer ni escribir
+en las tablas de `products-service` por accidente ni por diseño. Esto permite
+escalar, migrar o reemplazar cada base de datos de forma independiente, y evita
+el acoplamiento implícito que generaría una base compartida.
 
----
-
-## Arquitectura
-
-| Componente          | Puerto | Responsabilidad                                                                 |
-|---------------------|-------:|---------------------------------------------------------------------------------|
-| `products-service`  | `8081` | Login JWT, CRUD de productos, búsqueda, filtros, ordenamiento, endpoint interno |
-| `inventory-service` | `8082` | Consulta de stock, compras, idempotencia, validación contra `products-service`  |
-| `products-db`       | `5432` | Base de datos exclusiva de `products-service`                                   |
-| `inventory-db`      | `5433` | Base de datos exclusiva de `inventory-service`                                  |
-| `frontend`          | `5173` | Interfaz de administración                                                      |
-
-Cada servicio backend tiene su propia base de datos PostgreSQL. La comunicación entre servicios se realiza vía HTTP; no
-hay acceso cruzado a tablas entre microservicios.
+**Tradeoff aceptado:** joins entre entidades de distintos dominios requieren una
+llamada HTTP. En este caso el único join necesario es "validar que el producto
+existe", que se resuelve con una llamada ligera al endpoint interno de
+`products-service`.
 
 ---
 
-## Stack técnico
+## Concurrencia en compras: optimistic locking + retry
 
-### Backend
+La entidad `Inventory` tiene un campo `version BIGINT` gestionado por
+`@Version` de JPA. Cuando dos compras simultáneas leen el mismo registro y
+ambas intentan guardarlo, la segunda recibe `ObjectOptimisticLockingFailureException`.
 
-- Java 21
-- Spring Boot 3.3.x
-- Spring Web / WebFlux
-- Spring Security
-- Spring Data JPA
-- PostgreSQL
-- Flyway
-- Resilience4j
-- Spring Retry
-- MapStruct
-- Lombok
-- OpenAPI / Swagger
-- JUnit 5 / MockMvc / Testcontainers / JaCoCo
+```
+T1: lee version=5, descuenta, guarda version=6 → OK
+T2: lee version=5, descuenta, intenta guardar version=6 → FALLA (ya es 6)
+T2: reintenta — lee version=6, descuenta, guarda version=7 → OK
+```
 
-### Frontend
+El componente `PurchaseExecutor` usa `@Retryable(retryFor =
+ObjectOptimisticLockingFailureException.class, maxAttempts = 3)` con backoff
+exponencial de 50 ms. Si los tres intentos fallan, `@Recover` lanza
+`ConcurrentPurchaseException` → 409.
 
-- Vue 3
-- Vite
-- TypeScript
-- Pinia
-- Vue Router
-- Axios
-- Vitest
-- Playwright
+**Por qué optimistic y no pessimistic (`SELECT FOR UPDATE`):**
+el escenario esperado es baja contención por producto. El locking pesimista
+bloquea la fila durante toda la transacción, lo que degrada el throughput
+cuando hay muchas compras de productos distintos. Con optimistic locking la fila
+nunca se bloquea; solo hay coste cuando realmente hay colisión.
+
+**Garantía:** la constraint `CHECK (available >= 0)` en la DDL es la última
+línea de defensa — aunque un bug bypasee la lógica de aplicación, PostgreSQL
+rechazará cualquier `available` negativo.
 
 ---
 
-## Funcionalidades implementadas
+## Idempotencia: persistida en base de datos
 
-### `products-service`
+El endpoint `POST /api/v1/purchases` requiere el header `Idempotency-Key`. La
+llave se persiste en la tabla `idempotency_records` con tres estados posibles:
 
-- Login con credenciales demo `admin / admin123`
-- Emisión de JWT para el frontend
-- CRUD completo de productos
-- Paginación (`page`, `size`)
-- Filtro por `status`
-- Búsqueda por `sku` o `name`
-- Ordenamiento por `price` o `createdAt`
-- Endpoint interno protegido con `X-API-Key`
-- Errores en formato JSON:API
-- Correlation ID por request
-- Health checks y Swagger
+- `PROCESSING` — registro insertado al inicio, antes de ejecutar la compra.
+- `COMPLETED` — compra exitosa; la respuesta JSON se serializa y guarda.
+- `FAILED` — error de negocio (stock insuficiente, producto no encontrado,
+  servicio caído); el error JSON se guarda.
 
-### `inventory-service`
+Si llega un segundo request con la misma llave:
 
-- Consulta de inventario por `productId`
-- Compra con JWT obligatorio
-- Header `Idempotency-Key` obligatorio en `POST /api/v1/purchases`
-- Reutilización segura de respuestas para requests repetidos con la misma key
-- Manejo de stock insuficiente
-- Manejo de producto inexistente
-- Manejo de indisponibilidad de `products-service`
-- Protección de concurrencia con optimistic locking + retry
-- Logs estructurados con correlation ID
-- Health checks y Swagger
+- `COMPLETED` → se devuelve exactamente la misma respuesta sin tocar inventario.
+- `FAILED` → se relanza el error original.
+- `PROCESSING` → 409 (compra en curso, posible request duplicado en vuelo).
 
-### `frontend`
+**Por qué en PostgreSQL y no en Redis:** Redis añade una dependencia
+infraestructural extra. Como los registros de idempotencia conviven en el mismo
+motor que el inventario, la inserción del registro `PROCESSING` y el descuento
+de stock pueden coordinarse en la misma unidad de trabajo, sin necesidad de
+transacciones distribuidas.
 
-- Login
-- Protección de rutas
-- Listado de productos
-- Filtros, búsqueda, ordenamiento y paginación
-- Crear, editar y eliminar productos
-- Ver detalle de producto
-- Consultar inventario
-- Ejecutar compras
-- Manejo de errores de validación y negocio
+**Race condition al insertar PROCESSING:** si dos requests llegan simultáneamente
+con la misma llave antes de que ninguno haya insertado el registro, la constraint
+`UNIQUE (idempotency_key)` garantiza que solo uno tendrá éxito. El otro recibe
+`DataIntegrityViolationException`, que se convierte en 409.
+
+**TTL y limpieza:** los registros expiran tras 24 horas (configurable via
+`IDEMPOTENCY_TTL_HOURS`). Un `@Scheduled` cada hora borra los expirados para
+mantener la tabla acotada.
 
 ---
 
-## Estructura del proyecto
+## Resiliencia: Resilience4j con WebClient
 
-```text
-.
-├── docs/
-│   └── technical-decisions.md
-├── frontend/
-│   ├── src/
-│   │   ├── api/
-│   │   ├── router/
-│   │   ├── stores/
-│   │   ├── types/
-│   │   ├── views/
-│   │   ├── App.vue
-│   │   └── main.ts
-│   ├── package.json
-│   ├── vite.config.ts
-│   ├── vitest.config.ts
-│   └── playwright.config.ts
-├── infra/
-│   └── docker-compose.yml
-├── inventory-service/
-│   ├── src/main/java/com/tienda/inventory/
-│   ├── src/main/resources/
-│   └── pom.xml
-├── products-service/
-│   ├── src/main/java/com/tienda/products/
-│   ├── src/main/resources/
-│   └── pom.xml
-├── .env.example
-└── README.md
-```
+La comunicación de `inventory-service` hacia `products-service` usa `WebClient`
+(Reactor Netty) con timeouts explícitos en el cliente HTTP:
+
+- **Connect timeout:** 2 s (si el socket no conecta en 2 s, falla rápido).
+- **Response timeout:** 3 s (si products-service no responde en 3 s, falla).
+
+Sobre eso se aplica Resilience4j:
+
+| Mecanismo           | Configuración                                 | Propósito                                      |
+|---------------------|-----------------------------------------------|------------------------------------------------|
+| **Retry**           | 2 intentos, 200 ms entre ellos                | Absorber fallos transitorios de red            |
+| **Circuit Breaker** | Ventana 10 llamadas, umbral 50%, 15 s abierto | Dejar de golpear un servicio caído             |
+| **TimeLimiter**     | 3 s                                           | Cortar llamadas lentas antes de agotar threads |
+
+**Distinción de errores:** el cliente distingue dos familias de fallo:
+
+- `404` de products-service → `ProductNotFoundException` → 404 al cliente.
+- Cualquier otro error de red o HTTP → `ProductServiceUnavailableException` → 503 al cliente.
+
+Solo `ProductServiceUnavailableException` activa reintentos y circuit breaker.
+`ProductNotFoundException` se propaga directamente sin reintentar, porque
+reintentar un 404 nunca va a cambiar el resultado.
 
 ---
 
-## Requisitos
+## Seguridad: JWT compartido + API Key interna
 
-- Java 21
-- Maven 3.9+
-- Node.js 20+
-- npm 10+
-- Docker Desktop
+El JWT lo emite `products-service` y lo valida también `inventory-service`
+usando el mismo secreto (`JWT_SECRET`). Esto evita un servicio de identidad
+dedicado, que sería sobredimensionado para esta prueba.
 
----
+**Tradeoff:** si el secreto rota, ambos servicios deben reiniciarse
+coordinadamente. En producción real se usaría un par de claves asimétricas
+(RS256) y `inventory-service` solo necesitaría la clave pública.
 
-## Variables de entorno
-
-Copia el archivo de ejemplo:
-
-```bash
-cp .env.example .env
-```
-
-Variables principales:
-
-| Variable                 | Descripción                                  | Valor por defecto                                 |
-|--------------------------|----------------------------------------------|---------------------------------------------------|
-| `SPRING_PROFILE`         | Perfil activo para backend                   | `dev`                                             |
-| `JWT_SECRET`             | Secreto compartido para firmar/validar JWT   | `cambiar-este-secreto-en-produccion-min-32-chars` |
-| `JWT_EXPIRATION_MS`      | Expiración del token                         | `3600000`                                         |
-| `INTERNAL_API_KEY`       | API Key para comunicación interna            | `dev-internal-key-cambiar-en-produccion`          |
-| `PRODUCTS_DB_PORT`       | Puerto PostgreSQL products                   | `5432`                                            |
-| `INVENTORY_DB_PORT`      | Puerto PostgreSQL inventory                  | `5433`                                            |
-| `PRODUCTS_SERVICE_PORT`  | Puerto products-service                      | `8081`                                            |
-| `INVENTORY_SERVICE_PORT` | Puerto inventory-service                     | `8082`                                            |
-| `RATE_LIMIT_CAPACITY`    | Capacidad del rate limit de products-service | `50`                                              |
-| `RATE_LIMIT_REFILL`      | Refill por minuto                            | `50`                                              |
-| `IDEMPOTENCY_TTL_HOURS`  | TTL de registros de idempotencia             | `24`                                              |
+El endpoint `GET /internal/v1/products/{id}` de `products-service` está
+protegido por `X-API-Key` en lugar de JWT. El frontend nunca llama a esa
+ruta; solo la usa `inventory-service` con una clave que nunca sale al navegador.
 
 ---
 
-## Ejecución local
+## Evento InventoryChanged
 
-### 1. Levantar infraestructura
+Cuando una compra se completa, `PurchaseServiceImpl` emite un log estructurado:
 
-Desde `infra/`:
-
-```bash
-cd infra
-docker compose up -d products-db inventory-db
+```
+InventoryChanged: productId={} quantityDeducted={} remainingStock={} correlationId={}
 ```
 
-### 2. Levantar `products-service`
-
-```bash
-cd products-service
-mvn spring-boot:run
-```
-
-Servicio disponible en:
-
-- `http://localhost:8081`
-- Swagger: `http://localhost:8081/swagger-ui/index.html`
-- Health: `http://localhost:8081/actuator/health`
-
-### 3. Levantar `inventory-service`
-
-```bash
-cd inventory-service
-mvn spring-boot:run
-```
-
-Servicio disponible en:
-
-- `http://localhost:8082`
-- Swagger: `http://localhost:8082/swagger-ui/index.html`
-- Health: `http://localhost:8082/actuator/health`
-
-### 4. Levantar frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Frontend disponible en:
-
-- `http://localhost:5173`
-
-> El frontend usa proxy de Vite para redirigir:
-> - `/api/v1/auth` y `/api/v1/products` hacia `http://localhost:8081`
-> - `/api/v1/inventory` y `/api/v1/purchases` hacia `http://localhost:8082`
+Este log cumple el mínimo requerido. La extensión natural sería publicar el
+evento a un outbox o a Kafka/RabbitMQ para que otros servicios reaccionen sin
+acoplamiento directo, pero queda fuera del alcance de esta prueba.
 
 ---
 
-## Credenciales demo
+## Correlation ID
 
-```text
-usuario: admin
-contraseña: admin123
-```
-
----
-
-## Endpoints principales
-
-### Auth
-
-- `POST /api/v1/auth/login`
-
-### Products
-
-- `GET /api/v1/products`
-- `GET /api/v1/products/{id}`
-- `POST /api/v1/products`
-- `PUT /api/v1/products/{id}`
-- `DELETE /api/v1/products/{id}`
-
-### Internal products
-
-- `GET /internal/v1/products/{id}`
-
-### Inventory
-
-- `GET /api/v1/inventory/{productId}`
-
-### Purchases
-
-- `POST /api/v1/purchases`
-
----
-
-## Ejemplos rápidos
-
-### Login
-
-```bash
-curl -X POST http://localhost:8081/api/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{
-    "username": "admin",
-    "password": "admin123"
-  }'
-```
-
-### Listar productos
-
-```bash
-curl "http://localhost:8081/api/v1/products?page=0&size=10&sortBy=createdAt&sortDir=desc" \
-  -H "Authorization: Bearer TU_TOKEN"
-```
-
-### Consultar inventario
-
-```bash
-curl http://localhost:8082/api/v1/inventory/PRODUCT_ID \
-  -H "Authorization: Bearer TU_TOKEN"
-```
-
-### Comprar
-
-```bash
-curl -X POST http://localhost:8082/api/v1/purchases \
-  -H "Authorization: Bearer TU_TOKEN" \
-  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "productId": "PRODUCT_ID",
-    "quantity": 1
-  }'
-```
-
----
-
-## Tests
-
-### Frontend
-
-```bash
-cd frontend
-npm run build
-npm run test:unit
-npm run test:e2e
-```
-
-### `products-service`
-
-```bash
-cd products-service
-mvn test
-```
-
-### `inventory-service`
-
-```bash
-cd inventory-service
-mvn test
-```
-
----
-
-## Cobertura
-
-### `products-service`
-
-- **Instructions:** 90%
-- **Branches:** 62%
-
-### `inventory-service`
-
-- **Instructions:** 80%
-- **Branches:** 73%
-
-Los reportes JaCoCo se generan en:
-
-```text
-products-service/target/site/jacoco/index.html
-inventory-service/target/site/jacoco/index.html
-```
-
----
-
-## Decisiones técnicas destacadas
-
-Resumen:
-
-- base de datos separada por microservicio
-- optimistic locking + retry para concurrencia en compras
-- idempotencia persistida con respuesta serializada
-- Resilience4j para timeout, retry y circuit breaker
-- JWT para frontend
-- API Key para ruta interna de `products-service`
-- correlation ID en logs y respuestas de error
-- Flyway para migraciones y seed de datos en `dev`
-
-Detalle completo en:
-
-```text
-docs/technical-decisions.md
-```
-
----
-
-## Notas
-
-- El frontend guarda el JWT en `sessionStorage`.
-- `inventory-service` valida el token con el mismo secreto compartido por `products-service`.
-- Para ejecutar tests de integración con Testcontainers, Docker debe estar encendido.
-- El archivo `README.md` original del proyecto estaba desactualizado respecto al estado final; este contenido
-  corresponde al estado actual del repositorio.
-
----
-
-## Posibles mejoras futuras
-
-- refresh token / logout server-side
-- observabilidad centralizada con trazas
-- despliegue completo del frontend en contenedor dentro de `docker-compose`
-- pipeline CI/CD
-- contract testing entre servicios
-- hardening adicional de seguridad para producción
+Cada request recibe un UUID generado por el filtro `CorrelationIdFilter`
+(o reutiliza el header `X-Correlation-Id` si ya viene del caller). El ID se
+propaga via `MDC` a todos los logs del request y se incluye en las respuestas
+de error JSON:API. Esto permite reconstruir el flujo completo de una petición
+a través de ambos servicios consultando los logs por el mismo `correlationId`.
