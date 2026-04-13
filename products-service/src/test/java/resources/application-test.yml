@@ -1,0 +1,28 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+
+  flyway:
+    locations: classpath:db/migration
+
+security:
+  jwt:
+    secret: test-secret-32-chars-minimum-ok!!
+    expiration-ms: 3600000
+
+internal:
+  api-key: dev-internal-key-cambiar-en-produccion
+
+rate-limit:
+  capacity: 1000
+  refill-per-minute: 1000
+
+logging:
+  level:
+    com.tienda.products: WARN
+    org.springframework.security: WARN
+    org.hibernate.SQL: WARN
+    org.testcontainers: WARN
+    com.zaxxer.hikari: WARN

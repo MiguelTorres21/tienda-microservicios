@@ -1,0 +1,132 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: inventory-service
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/inventory_db}
+    username: ${DB_USER:inventory_user}
+    password: ${DB_PASSWORD:inventory_pass}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+security:
+  jwt:
+    secret: ${JWT_SECRET:cambiar-este-secreto-en-produccion-min-32-chars}
+
+products-service:
+  base-url: ${PRODUCTS_SERVICE_URL:http://localhost:8081}
+  internal-api-key: ${INTERNAL_API_KEY:dev-internal-key-cambiar-en-produccion}
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      products-client:
+        slidingWindowSize: 10
+        minimum-number-of-calls: 5
+        failureRateThreshold: 50
+        waitDurationInOpenState: 15s
+        permittedNumberOfCallsInHalfOpenState: 3
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+  timelimiter:
+    instances:
+      products-client:
+        timeoutDuration: 3s
+  retry:
+    instances:
+      products-client:
+        maxAttempts: 2
+        waitDuration: 200ms
+        retry-exceptions:
+          - com.tienda.inventory.exception.ProductServiceUnavailableException
+        ignore-exceptions:
+          - com.tienda.inventory.exception.ProductNotFoundException
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,db
+  health:
+    livenessState:
+      enabled: true
+    readinessState:
+      enabled: true
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operationsSorter: method
+
+idempotency:
+  ttl-hours: ${IDEMPOTENCY_TTL_HOURS:24}
+
+logging:
+  level:
+    com.tienda.inventory: INFO
+    org.springframework.security: WARN
+    org.hibernate.SQL: WARN
+  pattern:
+    console: '{"timestamp":"%d{yyyy-MM-dd HH:mm:ss.SSS}","level":"%p","service":"inventory-service","correlationId":"%X{correlationId}","logger":"%logger{36}","message":"%msg"}%n'
+
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+logging:
+  level:
+    com.tienda.inventory: DEBUG
+    org.hibernate.SQL: DEBUG
+
+---
+spring:
+  config:
+    activate:
+      on-profile: test
+  flyway:
+    locations: classpath:db/migration
+  jpa:
+    show-sql: true
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      products-client:
+        slidingWindowSize: 100
+        failureRateThreshold: 100
+
+logging:
+  level:
+    com.tienda.inventory: DEBUG
